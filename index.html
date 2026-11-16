@@ -103,8 +103,8 @@
             <!-- 조직관리 페이지 -->
             <div id="organization" class="page hidden">
                 <h2>조직 및 개인별 평가 결과</h2>
-                <p style="color:#6b7280; font-size:13px; margin-top:-6px; margin-bottom:20px;">
-                    산식: <b>프로젝트 점수 × (세부과업 가중치(%) / 100) × (세부과업 내 개인 투입비율(%) / 100)</b>
+                <p style="color:#6b7280; font-size:13px; margin-top:-6px; margin-bottom:15px;">
+                    산식: <b>(차등화된 합계 점수 × 합계 가중치) + (차등화된 평균 점수 × 평균 가중치)</b> (1등 점수 = 100% 기준 상대 평가)
                 </p>
                 <div id="organizationContent"></div>
             </div>
@@ -120,7 +120,7 @@
     firebase.initializeApp(firebaseConfig);
     const db = firebase.database();
 
-    let state = { projects: [] };
+    let state = { projects: [], weights: { total: 50, average: 50 } };
     let selectedId = null;
 
     const $ = (id) => document.getElementById(id);
@@ -135,16 +135,20 @@
     async function load() {
         try {
             const snapshot = await db.ref('projectGaugeData').once('value');
-            state = snapshot.val() || { projects: [] };
+            const data = snapshot.val() || {};
+            state.projects = data.projects || [];
+            state.weights = data.weights || { total: 50, average: 50 };
             if (state.projects.length > 0 && !selectedId) {
                 selectedId = state.projects[0].id;
             }
             return state;
-        } catch (e) { return { projects: [] }; }
+        } catch (e) { return { projects: [], weights: { total: 50, average: 50 } }; }
     }
 
     db.ref('projectGaugeData').on('value', (snapshot) => {
-        state = snapshot.val() || { projects: [] };
+        const data = snapshot.val() || {};
+        state.projects = data.projects || [];
+        state.weights = data.weights || { total: 50, average: 50 };
         if (state.projects.length > 0 && (!selectedId || !state.projects.some(p => p.id === selectedId))) {
             selectedId = state.projects[0].id;
         }
@@ -255,7 +259,6 @@
         weightSumElem.textContent = totalWeight + "%";
         weightSumElem.className = totalWeight !== 100 ? "alert-text" : "normal-text";
 
-        // 각 팀원별 투입비율 총합 계산 (테이블 상단 헤더 표시용)
         const memberInputSums = {};
         p.members.forEach(m => {
             memberInputSums[m.id] = details.reduce((sum, det) => {
@@ -311,7 +314,6 @@
         html += `</tbody></table>`;
         $("evaluationTable").innerHTML = html;
 
-        // 이벤트 바인딩
         document.querySelectorAll("[data-weight]").forEach(i => i.onchange = () => {
             const det = allDetails(p).find(x => x.id == i.dataset.weight);
             if (det) { det.weight = Number(i.value); save(); renderEvaluation(); renderOrganization(); }
@@ -368,6 +370,7 @@
             return;
         }
 
+        // 1. 개인별 합계 및 평균 집계
         const personMap = new Map();
         state.projects.forEach(p => {
             const members = p.members || [];
@@ -389,11 +392,48 @@
             });
         });
 
+        // 배열로 변환 후 평균 계산
+        const persons = [];
+        personMap.forEach(person => {
+            const avgScore = person.projectCount > 0 ? (person.totalScore / person.projectCount) : 0;
+            persons.push({ ...person, avgScore });
+        });
+
+        // 2. 1등 기준 상대 차등화(Normalize)를 위한 최대값(Max) 탐색
+        let maxTotal = 0;
+        let maxAvg = 0;
+        persons.forEach(p => {
+            if (p.totalScore > maxTotal) maxTotal = p.totalScore;
+            if (p.avgScore > maxAvg) maxAvg = p.avgScore;
+        });
+
+        const weightTotal = Number(state.weights.total) || 0;
+        const weightAverage = Number(state.weights.average) || 0;
+        const weightSum = weightTotal + weightAverage;
+
         let html = `
+            <div class="org-card" style="background:#f8fafc; border:1px solid #cbd5e1;">
+                <h3 style="margin-top:0; margin-bottom:10px;">⚖️ 합계 및 평균 종합 평가 가중치 설정</h3>
+                <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">
+                    <div>
+                        합계 점수 가중치: <input type="number" id="weightTotalInput" value="${weightTotal}" style="width:60px; padding:4px; text-align:center;" min="0" max="100">%
+                    </div>
+                    <div>
+                        평균 점수 가중치: <input type="number" id="weightAvgInput" value="${weightAverage}" style="width:60px; padding:4px; text-align:center;" min="0" max="100">%
+                    </div>
+                    <div>
+                        가중치 총합: <b id="weightSumText" class="${weightSum === 100 ? 'normal-text' : 'alert-text'}">${weightSum}%</b> (목표: 100%)
+                    </div>
+                    <button class="btn small" id="saveWeightsBtn">가중치 저장</button>
+                </div>
+            </div>
+        `;
+
+        html += `
             <div class="org-card">
                 <div class="org-card-header">
-                    <h3 style="margin:0;">전체 구성원 누적 점수 요약</h3>
-                    <span class="badge">총 ${personMap.size}명</span>
+                    <h3 style="margin:0;">전체 구성원 종합 성과 순위 (1등 기준 100점 환산)</h3>
+                    <span class="badge">총 ${persons.length}명</span>
                 </div>
                 <table>
                     <thead>
@@ -402,31 +442,47 @@
                             <th>직급</th>
                             <th>이름</th>
                             <th>참여 프로젝트 수</th>
-                            <th>누적 점수 합계</th>
+                            <th>합계 점수 (원점수)</th>
+                            <th>평균 점수 (원점수)</th>
+                            <th>합계 차등화 (100점 만점)</th>
+                            <th>평균 차등화 (100점 만점)</th>
+                            <th>최종 종합 점수</th>
                         </tr>
                     </thead>
                     <tbody>
         `;
 
-        if (personMap.size === 0) {
-            html += `<tr><td colspan="5">등록된 구성원이 없습니다.</td></tr>`;
+        if (persons.length === 0) {
+            html += `<tr><td colspan="9">등록된 구성원이 없습니다.</td></tr>`;
         } else {
-            personMap.forEach(person => {
+            // 최종 종합 점수 기준으로 내림차순 정렬
+            persons.forEach(p => {
+                p.normTotal = maxTotal > 0 ? (p.totalScore / maxTotal) * 100 : 0;
+                p.normAvg = maxAvg > 0 ? (p.avgScore / maxAvg) * 100 : 0;
+                p.finalScore = (p.normTotal * (weightTotal / 100)) + (p.normAvg * (weightAverage / 100));
+            });
+            persons.sort((a, b) => b.finalScore - a.finalScore);
+
+            persons.forEach(person => {
                 html += `
                     <tr>
                         <td>${esc(person.dept)}</td>
                         <td>${esc(person.rank)}</td>
                         <td><b>${esc(person.name)}</b></td>
                         <td>${person.projectCount}개</td>
-                        <td class="normal-text">${person.totalScore.toFixed(2)}점</td>
+                        <td>${person.totalScore.toFixed(2)}점</td>
+                        <td>${person.avgScore.toFixed(2)}점</td>
+                        <td>${person.normTotal.toFixed(1)}점</td>
+                        <td>${person.normAvg.toFixed(1)}점</td>
+                        <td class="normal-text" style="font-size:15px;"><b>${person.finalScore.toFixed(2)}점</b></td>
                     </tr>
                 `;
             });
         }
         html += `</tbody></table></div>`;
 
-        html += `<h3 style="margin-top:28px; margin-bottom:12px;">프로젝트별 개인 점수 및 현황</h3>`;
-
+        // 프로젝트별 상세 내역 카드들도 유지
+        html += `<h3 style="margin-top:28px; margin-bottom:12px;">프로젝트별 개인 점수 현황</h3>`;
         state.projects.forEach(p => {
             const members = p.members || [];
             const memberScores = members.map(m => ({
@@ -475,19 +531,25 @@
                         </tr>
                     `;
                 });
-                html += `
-                    <tr style="background:#f8fafc; font-weight:bold;">
-                        <td colspan="3">전체 참여자 획득 점수 합계 (목표 총점: ${projScore}점)</td>
-                        <td style="color:${Math.abs(totalEarned - projScore) < 0.01 ? '#047857' : '#ef4444'};">
-                            ${totalEarned.toFixed(2)}점 
-                        </td>
-                    </tr>
-                `;
             }
             html += `</tbody></table></div>`;
         });
 
         container.innerHTML = html;
+
+        // 가중치 저장 버튼 이벤트 연결
+        $("saveWeightsBtn").onclick = () => {
+            const tVal = Number($("weightTotalInput").value);
+            const aVal = Number($("weightAvgInput").value);
+            if (tVal + aVal !== 100) {
+                return alert("합계 가중치와 평균 가중치의 합은 정확히 100%여야 합니다.");
+            }
+            state.weights.total = tVal;
+            state.weights.average = aVal;
+            save();
+            renderOrganization();
+            alert("가중치가 성공적으로 저장되었습니다.");
+        };
     }
 
     function exportToExcel() {
@@ -523,15 +585,6 @@
                 }
             });
         }
-
-        excelData.push([]);
-        excelData.push(["[조직관리 및 개인별 획득 점수 결과]"]);
-        excelData.push(["부서", "직급", "이름", "획득 점수"]);
-
-        members.forEach(m => {
-            const earned = calcMemberProjectScore(p, m.id);
-            excelData.push([m.dept || '-', m.rank || '-', m.name || '-', Number(earned.toFixed(2))]);
-        });
 
         const worksheet = XLSX.utils.aoa_to_sheet(excelData);
         const workbook = XLSX.utils.book_new();
